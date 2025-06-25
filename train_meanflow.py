@@ -18,9 +18,10 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 
-from models.sit import SiT_models
-from loss import SILoss
+from models.sit_meanflow import SiT_models
+# from loss import SILoss
 from utils import load_encoders
+from meanflow import MeanFlow
 
 from dataset import CustomDataset
 from diffusers.models import AutoencoderKL
@@ -165,7 +166,7 @@ def main(args):
     model = SiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes,
-        use_cfg = (args.cfg_prob > 0),
+        use_cfg = (args.guidance_eq == "cfg"),
         z_dims = z_dims,
         encoder_depth=args.encoder_depth,
         **block_kwargs
@@ -184,14 +185,22 @@ def main(args):
         ).view(1, 4, 1, 1).to(device)
 
     # create loss function
-    loss_fn = SILoss(
-        prediction=args.prediction,
-        path_type=args.path_type, 
-        encoders=encoders,
-        accelerator=accelerator,
-        latents_scale=latents_scale,
-        latents_bias=latents_bias,
-        weighting=args.weighting
+    loss_fn = MeanFlow(
+        noise_dist=args.noise_dist,
+        P_mean=args.P_mean,
+        P_std=args.P_std,
+        data_proportion=args.data_proportion,
+        guidance_eq=args.guidance_eq,
+        omega=args.omega,
+        kappa=args.kappa,
+        t_start=args.t_start,
+        t_end=args.t_end,
+        jvp_fn=args.jvp_fn,
+        norm_p=args.norm_p,
+        norm_eps=args.norm_eps,
+        num_classes=args.num_classes,
+        class_dropout_prob=args.class_dropout_prob,
+        sampling_schedule_type=args.sampling_schedule_type,
     )
     if accelerator.is_main_process:
         logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -211,7 +220,11 @@ def main(args):
     
     # Setup data:
     train_dataset = CustomDataset(args.data_dir)
-    local_batch_size = int(args.batch_size // accelerator.num_processes)
+    local_batch_size = int(args.batch_size // accelerator.num_processes // args.gradient_accumulation_steps)
+    
+    steps_per_epoch = len(train_dataset) // args.batch_size
+    max_train_steps = min(args.max_train_steps, steps_per_epoch * args.epochs)
+    
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=local_batch_size,
@@ -256,7 +269,7 @@ def main(args):
         )
         
     progress_bar = tqdm(
-        range(0, args.max_train_steps),
+        range(0, max_train_steps),
         initial=global_step,
         desc="Steps",
         # Only show the progress bar once on each machine.
@@ -284,31 +297,29 @@ def main(args):
             x = x.squeeze(dim=1).to(device)
             y = y.to(device)
             z = None
-            if args.legacy:
-                # In our early experiments, we accidentally apply label dropping twice: 
-                # once in train.py and once in sit.py. 
-                # We keep this option for exact reproducibility with previous runs.
-                drop_ids = torch.rand(y.shape[0], device=y.device) < args.cfg_prob
-                labels = torch.where(drop_ids, args.num_classes, y)
-            else:
-                labels = y
+            labels = y
+            zs = None
             with torch.no_grad():
                 x = sample_posterior(x, latents_scale=latents_scale, latents_bias=latents_bias)
-                zs = []
-                with accelerator.autocast():
-                    for encoder, encoder_type, arch in zip(encoders, encoder_types, architectures):
-                        raw_image_ = preprocess_raw_image(raw_image, encoder_type)
-                        z = encoder.forward_features(raw_image_)
-                        if 'mocov3' in encoder_type: z = z = z[:, 1:] 
-                        if 'dinov2' in encoder_type: z = z['x_norm_patchtokens']
-                        zs.append(z)
+                if args.encoder_depth > 0:
+                    zs = []
+                    with accelerator.autocast():
+                        for encoder, encoder_type, arch in zip(encoders, encoder_types, architectures):
+                            raw_image_ = preprocess_raw_image(raw_image, encoder_type)
+                            z = encoder.forward_features(raw_image_)
+                            if 'mocov3' in encoder_type: z = z = z[:, 1:] 
+                            if 'dinov2' in encoder_type: z = z['x_norm_patchtokens']
+                            zs.append(z)
 
             with accelerator.accumulate(model):
-                model_kwargs = dict(y=labels)
-                loss, proj_loss = loss_fn(model, x, model_kwargs, zs=zs)
+                loss, proj_loss, v_loss = loss_fn(model, x, labels=labels, zs=zs)
                 loss_mean = loss.mean()
-                proj_loss_mean = proj_loss.mean()
-                loss = loss_mean + proj_loss_mean * args.proj_coeff
+                if args.encoder_depth > 0:
+                    proj_loss_mean = proj_loss.mean()
+                    loss = loss_mean + proj_loss_mean * args.proj_coeff
+                else:
+                    loss = loss_mean
+                v_loss_mean = v_loss.detach().mean()
                     
                 ## optimization
                 accelerator.backward(loss)
@@ -325,54 +336,52 @@ def main(args):
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1                
-            if global_step % args.checkpointing_steps == 0 and global_step > 0:
-                if accelerator.is_main_process:
-                    checkpoint = {
-                        "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
-                        "opt": optimizer.state_dict(),
-                        "args": args,
-                        "steps": global_step,
-                    }
-                    checkpoint_path = f"{checkpoint_dir}/{global_step:07d}.pt"
-                    torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
+                if global_step % args.checkpointing_steps == 0 and global_step > 0:
+                    if accelerator.is_main_process:
+                        checkpoint = {
+                            "model": model.module.state_dict(),
+                            "ema": ema.state_dict(),
+                            "opt": optimizer.state_dict(),
+                            "args": args,
+                            "steps": global_step,
+                        }
+                        checkpoint_path = f"{checkpoint_dir}/{global_step:07d}.pt"
+                        torch.save(checkpoint, checkpoint_path)
+                        logger.info(f"Saved checkpoint to {checkpoint_path}")
 
-            if (global_step == 1 or (global_step % args.sampling_steps == 0 and global_step > 0)):
-                from samplers import euler_sampler
-                with torch.no_grad():
-                    samples = euler_sampler(
-                        model, 
-                        xT, 
-                        ys,
-                        num_steps=50, 
-                        cfg_scale=4.0,
-                        guidance_low=0.,
-                        guidance_high=1.,
-                        path_type=args.path_type,
-                        heun=False,
-                    ).to(torch.float32)
-                    samples = vae.decode((samples -  latents_bias) / latents_scale).sample
-                    gt_samples = vae.decode((gt_xs - latents_bias) / latents_scale).sample
-                    samples = (samples + 1) / 2.
-                    gt_samples = (gt_samples + 1) / 2.
-                out_samples = accelerator.gather(samples.to(torch.float32))
-                gt_samples = accelerator.gather(gt_samples.to(torch.float32))
-                accelerator.log({"samples": wandb.Image(array2grid(out_samples)),
-                                 "gt_samples": wandb.Image(array2grid(gt_samples))})
-                logging.info("Generating EMA samples done.")
+                if (global_step == 1 or (global_step % args.sampling_steps == 0 and global_step > 0)):
+                    from meanflow import mean_flow_sampler
+                    with torch.no_grad():
+                        samples = mean_flow_sampler(
+                            model, 
+                            loss_fn,
+                            xT, 
+                            ys,
+                            num_steps=1, 
+                        ).to(torch.float32)
+                        samples = vae.decode((samples -  latents_bias) / latents_scale).sample
+                        gt_samples = vae.decode((gt_xs - latents_bias) / latents_scale).sample
+                        samples = (samples + 1) / 2.
+                        gt_samples = (gt_samples + 1) / 2.
+                    out_samples = accelerator.gather(samples.to(torch.float32))
+                    gt_samples = accelerator.gather(gt_samples.to(torch.float32))
+                    accelerator.log({"samples": wandb.Image(array2grid(out_samples)),
+                                    "gt_samples": wandb.Image(array2grid(gt_samples))})
+                    logging.info("Generating EMA samples done.")
 
-            logs = {
-                "loss": accelerator.gather(loss_mean).mean().detach().item(), 
-                "proj_loss": accelerator.gather(proj_loss_mean).mean().detach().item(),
-                "grad_norm": accelerator.gather(grad_norm).mean().detach().item()
-            }
-            progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
+                logs = {
+                    "loss": accelerator.gather(loss_mean).mean().detach().item(), 
+                    "grad_norm": accelerator.gather(grad_norm).mean().detach().item(),
+                    "v_loss": accelerator.gather(v_loss_mean).mean().detach().item(),
+                }
+                if args.encoder_depth > 0:
+                    logs["proj_loss"] = accelerator.gather(proj_loss_mean).mean().detach().item()
+                progress_bar.set_postfix(**logs)
+                accelerator.log(logs, step=global_step)
 
-            if global_step >= args.max_train_steps:
+            if global_step >= max_train_steps:
                 break
-        if global_step >= args.max_train_steps:
+        if global_step >= max_train_steps:
             break
 
     model.eval()  # important! This disables randomized embedding dropout
@@ -397,8 +406,8 @@ def parse_args(input_args=None):
     # model
     parser.add_argument("--model", type=str)
     parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--encoder-depth", type=int, default=8)
-    parser.add_argument("--fused-attn", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--encoder-depth", type=int, default=0)
+    parser.add_argument("--fused-attn", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--qk-norm",  action=argparse.BooleanOptionalAction, default=False)
 
     # dataset
@@ -417,7 +426,7 @@ def parse_args(input_args=None):
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--adam-beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
-    parser.add_argument("--adam-beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
+    parser.add_argument("--adam-beta2", type=float, default=0.95, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument("--adam-weight-decay", type=float, default=0., help="Weight decay to use.")
     parser.add_argument("--adam-epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
     parser.add_argument("--max-grad-norm", default=1.0, type=float, help="Max gradient norm.")
@@ -429,19 +438,37 @@ def parse_args(input_args=None):
     parser.add_argument("--num-workers", type=int, default=4)
 
     # loss
-    parser.add_argument("--path-type", type=str, default="linear", choices=["linear", "cosine"])
-    parser.add_argument("--prediction", type=str, default="v", choices=["v"]) # currently we only support v-prediction
-    parser.add_argument("--cfg-prob", type=float, default=0.1)
+    parser.add_argument("--noise-dist", type=str, default="logit_normal", choices=["uniform", "logit_normal"])
+    parser.add_argument("--P-mean", type=float, default=-0.4)
+    parser.add_argument("--P-std", type=float, default=1.0)
+    parser.add_argument("--data-proportion", type=float, default=0.75)
+    parser.add_argument("--guidance-eq", type=str, default="cfg")
+    parser.add_argument("--omega", type=float, default=1.0)
+    parser.add_argument("--kappa", type=float, default=0.5)
+    parser.add_argument("--class-dropout-prob", type=float, default=0.1)
+    parser.add_argument("--t-start", type=float, default=0.0)
+    parser.add_argument("--t-end", type=float, default=1.0)
+    parser.add_argument("--jvp-fn", type=str, default="func", choices=["func", "autograd"])
+    parser.add_argument("--norm-p", type=float, default=1.0)
+    parser.add_argument("--norm-eps", type=float, default=1.0)
+    parser.add_argument("--num-steps", type=int, default=1)
+    parser.add_argument("--sampling-schedule-type", type=str, default="default")
     parser.add_argument("--enc-type", type=str, default='dinov2-vit-b')
     parser.add_argument("--proj-coeff", type=float, default=0.5)
-    parser.add_argument("--weighting", default="uniform", type=str, help="Max gradient norm.")
-    parser.add_argument("--legacy", action=argparse.BooleanOptionalAction, default=False)
+
+
 
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
         args = parser.parse_args()
-        
+    
+    if args.fused_attn:
+        raise NotImplementedError("fused (flash) attn is not compatible with jvp!")
+
+    if args.encoder_depth > 0:
+        raise NotImplementedError("MeanFlow with REPA is not implemented yet")
+    
     return args
 
 if __name__ == "__main__":

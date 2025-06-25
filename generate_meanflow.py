@@ -13,7 +13,7 @@ For a simple single-GPU/CPU sampling script, see sample.py.
 """
 import torch
 import torch.distributed as dist
-from models.mmdit import MMDiT
+from models.sit_meanflow import SiT_models
 from diffusers.models import AutoencoderKL
 from tqdm import tqdm
 import os
@@ -21,16 +21,7 @@ from PIL import Image
 import numpy as np
 import math
 import argparse
-from sampler_t2i import euler_sampler, euler_maruyama_sampler
-from utils import load_legacy_checkpoints, download_model
-
-from dataset import MSCOCO256Features
-from torch.utils.data import DataLoader
-
-from accelerate import Accelerator
-from accelerate.logging import get_logger
-from accelerate.utils import ProjectConfiguration, set_seed
-
+from meanflow import MeanFlow, mean_flow_sampler
 
 def create_npz_from_sample_folder(sample_dir, num=50_000):
     """
@@ -57,55 +48,61 @@ def main(args):
     assert torch.cuda.is_available(), "Sampling with DDP requires at least one GPU. sample.py supports CPU-only usage"
     torch.set_grad_enabled(False)
 
-    accelerator = Accelerator(mixed_precision=None)
-    device = accelerator.device
-    if args.global_seed is not None:
-        set_seed(args.global_seed + accelerator.process_index)
+    # Setup DDP:cd
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    device = rank % torch.cuda.device_count()
+    seed = args.global_seed * dist.get_world_size() + rank
+    torch.manual_seed(seed)
+    torch.cuda.set_device(device)
+    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+
     # Load model:
     block_kwargs = {"fused_attn": args.fused_attn, "qk_norm": args.qk_norm}
     latent_size = args.resolution // 8
-    model = MMDiT(
+    model = SiT_models[args.model](
         input_size=latent_size,
-        z_dims =  [int(z_dim) for z_dim in args.projector_embed_dims.split(',')],
+        num_classes=args.num_classes,
+        use_cfg = True,
         encoder_depth=args.encoder_depth,
+        **block_kwargs,
     ).to(device)
-
-    # Setup data:
-    all_dataset = MSCOCO256Features(path='../data/coco256_features', mode='val', ret_caption=True)
-    val_dataset = all_dataset.test
-    y_null = torch.from_numpy(all_dataset.empty_context).to(device).unsqueeze(0)
-    local_batch_size = args.per_proc_batch_size
-    val_dataloader = DataLoader(
-        val_dataset,
-        batch_size=local_batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True,
-        drop_last=False
-    )
-
-    val_dataloader = accelerator.prepare(val_dataloader)
     # Auto-download a pre-trained model or load a custom SiT checkpoint from train.py:
     ckpt_path = args.ckpt
-    state_dict = torch.load(ckpt_path, map_location="cpu")['model']
+    state_dict = torch.load(ckpt_path, map_location=f'cuda:{device}', weights_only=False)
+    if "ema" in state_dict:
+        state_dict = state_dict['ema']
+
     model.load_state_dict(state_dict)
     model.eval()  # important!
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
-    assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale be >= 1.0"
-    using_cfg = args.cfg_scale > 1.0
+    
+    meanflow_fn = MeanFlow(
+        noise_dist=args.noise_dist,
+        P_mean=args.P_mean,
+        P_std=args.P_std,
+        data_proportion=args.data_proportion,
+        guidance_eq=args.guidance_eq,
+        omega=args.omega,
+        kappa=args.kappa,
+        t_start=args.t_start,
+        t_end=args.t_end,
+        jvp_fn=args.jvp_fn,
+        norm_p=args.norm_p,
+        norm_eps=args.norm_eps,
+        num_classes=args.num_classes,
+        class_dropout_prob=args.class_dropout_prob,
+        sampling_schedule_type=args.sampling_schedule_type,
+    )
 
     # Create folder to save samples:
-    if args.prefix == "":
-        folder_name = f"coco-size-{args.resolution}-vae-{args.vae}-" \
-                    f"cfg-{args.cfg_scale}-seed-{args.global_seed}-{args.mode}"
-    else:
-        folder_name = f"{args.prefix}-coco-size-{args.resolution}-vae-{args.vae}-" \
-                    f"cfg-{args.cfg_scale}-seed-{args.global_seed}-{args.mode}"
+    model_string_name = args.model.replace("/", "-")
+    ckpt_string_name = os.path.basename(args.ckpt).replace(".pt", "")
+    folder_name = f"{model_string_name}-{ckpt_string_name}-size-{args.resolution}-vae-{args.vae}-" \
+                  f"-seed-{args.global_seed}"
     sample_folder_dir = f"{args.sample_dir}/{folder_name}"
-    real_sample_folder_dir = f"{args.sample_dir}/{folder_name}_real"
-    if accelerator.is_main_process:
+    if rank == 0:
         os.makedirs(sample_folder_dir, exist_ok=True)
-        os.makedirs(real_sample_folder_dir, exist_ok=True)
         print(f"Saving .png samples at {sample_folder_dir}")
     dist.barrier()
 
@@ -113,46 +110,35 @@ def main(args):
     n = args.per_proc_batch_size
     global_batch_size = n * dist.get_world_size()
     # To make things evenly-divisible, we'll sample a bit more than we need and then discard the extra samples:
-    total_samples = 40192
-    if accelerator.is_main_process:
+    total_samples = int(math.ceil(args.num_fid_samples / global_batch_size) * global_batch_size)
+    if rank == 0:
         print(f"Total number of images that will be sampled: {total_samples}")
         print(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
-        print(f"projector Parameters: {sum(p.numel() for p in model.projectors.parameters()):,}")
+        if hasattr(model, "projectors"):
+            print(f"projector Parameters: {sum(p.numel() for p in model.projectors.parameters()):,}")
     assert total_samples % dist.get_world_size() == 0, "total_samples must be divisible by world_size"
     samples_needed_this_gpu = int(total_samples // dist.get_world_size())
     assert samples_needed_this_gpu % n == 0, "samples_needed_this_gpu must be divisible by the per-GPU batch size"
     iterations = int(samples_needed_this_gpu // n)
     pbar = range(iterations)
-    pbar = tqdm(pbar) if accelerator.is_main_process else pbar
+    pbar = tqdm(pbar) if rank == 0 else pbar
     total = 0
-    clipsim_sum = 0.
-    from utils import ClipSimilarity
-    clipsim_fn = ClipSimilarity(device=device)
-
-    for raw_image, _, context, raw_captions in val_dataloader:
+    for _ in pbar:
         # Sample inputs:
         z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
+        y = torch.randint(0, args.num_classes, (n,), device=device)
 
         # Sample images:
         sampling_kwargs = dict(
             model=model, 
+            mean_flow=meanflow_fn,
             latents=z,
-            y=context,
-            y_null=y_null.repeat(context.shape[0], 1, 1),
+            labels=y,
             num_steps=args.num_steps, 
-            heun=args.heun,
-            cfg_scale=args.cfg_scale,
-            guidance_low=args.guidance_low,
-            guidance_high=args.guidance_high,
-            path_type=args.path_type,
         )
-        with torch.no_grad():
-            if args.mode == "sde":
-                samples = euler_maruyama_sampler(**sampling_kwargs).to(torch.float32)
-            elif args.mode == "ode":
-                samples = euler_sampler(**sampling_kwargs).to(torch.float32)
-            else:
-                raise NotImplementedError()
+        with torch.no_grad():            
+            samples = mean_flow_sampler(**sampling_kwargs).to(torch.float32)
+
             latents_scale = torch.tensor(
                 [0.18215, 0.18215, 0.18215, 0.18215, ]
                 ).view(1, 4, 1, 1).to(device)
@@ -164,36 +150,21 @@ def main(args):
             samples = torch.clamp(
                 255. * samples, 0, 255
                 ).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
-            # real_samples = (raw_image).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
 
             # Save samples to disk as individual .png files
             for i, sample in enumerate(samples):
-                index = i * accelerator.num_processes + accelerator.local_process_index + total
+                index = i * dist.get_world_size() + rank + total
                 Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
-                # Image.fromarray(real_sample).save(f"{real_sample_folder_dir}/{index:06d}.png")
-            batch_clipsim = clipsim_fn(
-                torch.from_numpy(samples/255.).to(device).permute(0, 3, 1, 2), raw_captions
-                )
         total += global_batch_size
-        gather_clipsim_sum = [
-            torch.zeros_like(batch_clipsim) for _ in range(4)
-            ]
-        torch.distributed.all_gather(gather_clipsim_sum, batch_clipsim)
-        gather_clipsim_sum = torch.cat(gather_clipsim_sum).sum()
-        clipsim_sum += gather_clipsim_sum
-        if accelerator.is_main_process:
-            print(f"{total}: {clipsim_sum / total}")
-        if accelerator.is_main_process:
-            pbar.update(1)
 
     # Make sure all processes have finished saving their samples before attempting to convert to .npz
     dist.barrier()
-    if accelerator.is_main_process:
-        create_npz_from_sample_folder(sample_folder_dir, 40192)
-        # create_npz_from_sample_folder(real_sample_folder_dir, 40192)
+    if rank == 0:
+        create_npz_from_sample_folder(sample_folder_dir, args.num_fid_samples)
         print("Done.")
     dist.barrier()
     dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -207,11 +178,11 @@ if __name__ == "__main__":
     # logging/saving:
     parser.add_argument("--ckpt", type=str, default=None, help="Optional path to a SiT checkpoint.")
     parser.add_argument("--sample-dir", type=str, default="samples")
-    parser.add_argument("--prefix", type=str, default="")
 
     # model
+    parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
     parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--encoder-depth", type=int, default=8)
+    parser.add_argument("--encoder-depth", type=int, default=0)
     parser.add_argument("--resolution", type=int, choices=[256, 512], default=256)
     parser.add_argument("--fused-attn", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--qk-norm", action=argparse.BooleanOptionalAction, default=False)
@@ -224,17 +195,24 @@ if __name__ == "__main__":
     parser.add_argument("--num-fid-samples", type=int, default=50_000)
 
     # sampling related hyperparameters
-    parser.add_argument("--mode", type=str, default="ode")
-    parser.add_argument("--cfg-scale",  type=float, default=1.5)
-    parser.add_argument("--projector-embed-dims", type=str, default="768,1024")
-    parser.add_argument("--path-type", type=str, default="linear", choices=["linear", "cosine"])
-    parser.add_argument("--num-steps", type=int, default=50)
-    parser.add_argument("--heun", action=argparse.BooleanOptionalAction, default=False) # only for ode
-    parser.add_argument("--guidance-low", type=float, default=0.)
-    parser.add_argument("--guidance-high", type=float, default=1.)
-
-    # will be deprecated
-    parser.add_argument("--legacy", action=argparse.BooleanOptionalAction, default=False) # only for ode
+    parser.add_argument("--num-steps", type=int, default=1)
+    
+    # loss
+    parser.add_argument("--noise-dist", type=str, default="logit_normal", choices=["uniform", "logit_normal"])
+    parser.add_argument("--P-mean", type=float, default=-0.4)
+    parser.add_argument("--P-std", type=float, default=1.0)
+    parser.add_argument("--data-proportion", type=float, default=0.75)
+    parser.add_argument("--guidance-eq", type=str, default="cfg")
+    parser.add_argument("--omega", type=float, default=1.0)
+    parser.add_argument("--kappa", type=float, default=0.5)
+    parser.add_argument("--class-dropout-prob", type=float, default=0.1)
+    parser.add_argument("--t-start", type=float, default=0.0)
+    parser.add_argument("--t-end", type=float, default=1.0)
+    parser.add_argument("--jvp-fn", type=str, default="func", choices=["func", "autograd"])
+    parser.add_argument("--norm-p", type=float, default=1.0)
+    parser.add_argument("--norm-eps", type=float, default=1.0)
+    parser.add_argument("--sampling-schedule-type", type=str, default="default")
 
     args = parser.parse_args()
+    
     main(args)

@@ -8,19 +8,20 @@ We follow the preprocessing code used in [edm2](https://github.com/NVlabs/edm2).
 After downloading ImageNet, please run the following scripts (please update 256x256 to 512x512 if you want to do experiments on 512x512 resolution);
 
 ```bash
-# Convert raw ImageNet data to a ZIP archive at 256x256 resolution
-python dataset_tools.py convert --source=[YOUR_DOWNLOAD_PATH]/ILSVRC/Data/CLS-LOC/train \
-    --dest=[TARGET_PATH]/images --resolution=256x256 --transform=center-crop-dhariwal
+torchrun --nproc_per_node=8 preprocessing.py \
+    --source=[YOUR_DOWNLOAD_PATH]/ILSVRC/Data/CLS-LOC/train \
+    --dest=[TARGET_PATH]/vae-sd \
+    --dest-images=[TARGET_PATH]/images \
+    --batch-size=128 \
+    --resolution=256 \
+    --transform=center-crop-dhariwal
 ```
 
-```bash
-# Convert the pixel data to VAE latents
-python dataset_tools.py encode --source=[TARGET_PATH]/images \
-    --dest=[TARGET_PATH]/vae-sd
-```
 
 Here,`YOUR_DOWNLOAD_PATH` is the directory that you downloaded the dataset, and `TARGET_PATH` is the directory that you will save the preprocessed images and corresponding compressed latent vectors. This directory will be used for your experiment scripts. 
 
 ## Acknowledgement
 
-This code is mainly built upon [edm2](https://github.com/NVlabs/edm2) repository.
+The original code is mainly built upon [edm2](https://github.com/NVlabs/edm2) repository.
+
+The multi-GPU preprocssing is writen by [this PR](https://github.com/sihyun-yu/REPA/pull/43).

@@ -1,2 +1,8 @@
 *.DS_Store
 .vscode/
+*__pycache__/
+exps/
+batchscript-*
+*.out
+wandb/
+samples/
