@@ -105,3 +105,7 @@ download_*.sh
 check_*.sh
 preprocessing_single.py
 train_*.sh
+
+# TensorFlow模型文件
+classify_image_graph_def.pb
+*.pb
