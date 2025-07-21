@@ -160,13 +160,14 @@ class MeanFlow:
         # -----------------------------------------------------------------
         # Compute loss
         u_tgt = v_g - torch.clamp(t - r, min=0.0, max=1.0) * du_dt
+        u_tgt = u_tgt.detach()
         
         denoising_loss = (u - u_tgt) ** 2
         denoising_loss = torch.sum(denoising_loss, dim=(1, 2, 3))
 
         # Adaptive weighting
         adp_wt = (denoising_loss + self.norm_eps) ** self.norm_p
-        denoising_loss = denoising_loss / adp_wt
+        denoising_loss = denoising_loss / adp_wt.detach()
         
         # -----------------------------------------------------------------
         denoising_loss = denoising_loss.mean()  # mean over batch
