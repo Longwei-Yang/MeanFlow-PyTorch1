@@ -53,7 +53,7 @@ Example command:
 accelerate launch train_meanflow.py \
     --report-to="wandb" \
     --allow-tf32 \
-    --mixed-precision="fp16" \
+    --mixed-precision="bf16" \
     --seed=0 \
     --model="SiT-XL/2" \
     --proj-coeff=0.0 \
