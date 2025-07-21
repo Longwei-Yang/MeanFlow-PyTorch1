@@ -105,6 +105,7 @@ download_*.sh
 check_*.sh
 preprocessing_single.py
 train_*.sh
+/home/kz34/Longwei_Yang_Projects/ICLR2025/MeanFlow-PyTorch1/scripts
 
 # TensorFlow模型文件
 classify_image_graph_def.pb
