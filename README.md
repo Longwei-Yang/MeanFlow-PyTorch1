@@ -50,17 +50,17 @@ Currently, we provide experiments for [ImageNet](https://www.kaggle.com/competit
 
 Example command:
 ```bash
-accelerate launch train_meanflow.py \
+accelerate launch --config_file accelerate_config.yaml train_meanflow.py \
     --report-to="wandb" \
     --allow-tf32 \
     --mixed-precision="bf16" \
     --seed=0 \
-    --model="SiT-XL/2" \
+    --model="SiT-B/4" \
     --proj-coeff=0.0 \
     --encoder-depth=0 \
     --output-dir="exps" \
-    --exp-name="meanflow-sitxl" \
-    --batch-size=256 \
+    --exp-name="meanflow-sitb4-nosg" \
+    --batch-size=512 \
     --adam-beta2 0.95 \
     --epochs 240 \
     --gradient-accumulation-steps 2 \
@@ -68,7 +68,8 @@ accelerate launch train_meanflow.py \
     --t-end 0.75 \
     --omega 0.2 \
     --kappa 0.92 \
-    --data-dir=[YOUR_DATA_PATH]
+    --data-dir=/home/kz34/Longwei_Yang_Projects/ICLR2025/MeanFlow-PyTorch1/data/preprocessed \
+    --no-stop-gradient
 ```
 
 Then this script will automatically create the folder in `exps` to save logs and checkpoints. You can adjust the following options:

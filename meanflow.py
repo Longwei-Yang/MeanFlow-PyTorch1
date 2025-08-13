@@ -35,7 +35,9 @@ class MeanFlow:
         num_classes: int = 1000,
         class_dropout_prob: float = 0.1,
         # Inference parameters (used by the standalone generate function)
-        sampling_schedule_type: str = 'default'
+        sampling_schedule_type: str = 'default',
+        stop_gradient: bool = True
+
     ):
         
         # Store all hyperparameters
@@ -54,7 +56,8 @@ class MeanFlow:
         self.class_dropout_prob = class_dropout_prob
         self.sampling_schedule_type = sampling_schedule_type
         self.dtype = torch.float32
-        
+        self.stop_gradient = stop_gradient
+
         assert jvp_fn in ['func', 'autograd'], "jvp_fn must be 'func' or 'autograd'"
         if jvp_fn == 'func':
             self.jvp_fn = torch.func.jvp
@@ -160,8 +163,10 @@ class MeanFlow:
         # -----------------------------------------------------------------
         # Compute loss
         u_tgt = v_g - torch.clamp(t - r, min=0.0, max=1.0) * du_dt
-        u_tgt = u_tgt.detach()
-        
+
+        if self.stop_gradient:
+            u_tgt = u_tgt.detach()
+
         denoising_loss = (u - u_tgt) ** 2
         denoising_loss = torch.sum(denoising_loss, dim=(1, 2, 3))
 

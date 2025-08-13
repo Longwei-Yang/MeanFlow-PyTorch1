@@ -456,7 +456,7 @@ def parse_args(input_args=None):
     parser.add_argument("--enc-type", type=str, default='dinov2-vit-b')
     parser.add_argument("--proj-coeff", type=float, default=0.5)
 
-
+    parser.add_argument("--stop-gradient", action=argparse.BooleanOptionalAction, default=True)
 
     if input_args is not None:
         args = parser.parse_args(input_args)
