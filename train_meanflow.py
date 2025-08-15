@@ -201,6 +201,7 @@ def main(args):
         num_classes=args.num_classes,
         class_dropout_prob=args.class_dropout_prob,
         sampling_schedule_type=args.sampling_schedule_type,
+        stop_gradient=args.stop_gradient,
     )
     if accelerator.is_main_process:
         logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
