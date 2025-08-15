@@ -31,6 +31,7 @@ import math
 from torchvision.utils import make_grid
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from torchvision.transforms import Normalize
+import matplotlib.pyplot as plt
 
 logger = get_logger(__name__)
 
@@ -66,6 +67,126 @@ def array2grid(x):
     x = make_grid(x.clamp(0, 1), nrow=nrow, value_range=(0, 1))
     x = x.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to('cpu', torch.uint8).numpy()
     return x
+
+
+# Plot per-parameter gradient distributions (histograms) and save under the experiment folder.
+def plot_grad_distributions(
+    grads,
+    save_root,
+    epoch,
+    global_step,
+    args,
+    bins=100,
+    max_panels_per_fig=24,
+):
+    """
+    Plot per-parameter gradient distributions (histograms) and save under the experiment folder.
+
+    Args:
+        grads (List[Tensor]): list of per-parameter gradients in the same order as model.parameters()
+                              e.g., grads = [p.grad.detach().clone() for p in model.parameters() if p.requires_grad]
+        save_root (str): root dir for this experiment, e.g., os.path.join(args.output_dir, args.exp_name)
+        epoch (int): current epoch index
+        global_step (int): current global training step (before or after increment is fine, used for naming)
+        args (argparse.Namespace): full args; we will extract key fields for filename to help searching
+        bins (int): number of histogram bins
+        max_panels_per_fig (int): maximum number of subplots per saved figure; if there are more parameters,
+                                  the function will create multiple figures.
+    Returns:
+        List[str]: list of saved figure paths
+    """
+    # Ensure output directory
+    out_dir = os.path.join(save_root, "grads")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Flatten grads and convert to numpy for plotting
+    flat_grads = []
+    stats = []
+    for g in grads:
+        if g is None:
+            flat_grads.append(None)
+            stats.append((float('nan'), float('nan'), float('nan')))
+            continue
+        g_np = g.detach().float().view(-1).cpu().numpy()
+        flat_grads.append(g_np)
+        mu = float(np.mean(g_np)) if g_np.size > 0 else float('nan')
+        sigma = float(np.std(g_np)) if g_np.size > 0 else float('nan')
+        l2 = float(np.linalg.norm(g_np)) if g_np.size > 0 else float('nan')
+        stats.append((mu, sigma, l2))
+
+    # Helper to build a readable, disambiguating title
+    def fig_title(base_idx, idx_end):
+        return (f"Grad dists | exp={args.exp_name} | epoch={epoch} | step={global_step} | "
+                f"bs={args.batch_size} | lr={args.learning_rate:g} | "
+                f"clip={args.max_grad_norm:g} | range={base_idx}-{idx_end-1}")
+
+    # Number of figures needed
+    n_params = len(flat_grads)
+    saved_paths = []
+    if n_params == 0:
+        return saved_paths
+
+    # Determine subplot grid (rows x cols) up to max_panels_per_fig, prefer 4 columns
+    cols = 4
+    rows = int(np.ceil(min(max_panels_per_fig, n_params) / cols))
+
+    # Iterate chunks
+    start = 0
+    while start < n_params:
+        end = min(start + max_panels_per_fig, n_params)
+        chunk = flat_grads[start:end]
+        chunk_stats = stats[start:end]
+
+        # Recompute rows for last chunk if smaller
+        panels = end - start
+        rows = int(np.ceil(panels / cols))
+
+        fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3.0 * rows), squeeze=False)
+        axes = axes.flatten()
+
+        for i, (g_np, (mu, sigma, l2)) in enumerate(zip(chunk, chunk_stats)):
+            ax = axes[i]
+            if g_np is None or g_np.size == 0:
+                ax.set_title(f"param[{start + i}] | empty")
+                ax.axis("off")
+                continue
+
+            # Robust clipping of x-axis range for visibility
+            # Use percentiles to ignore extreme outliers when drawing hist
+            lo = np.percentile(g_np, 0.1)
+            hi = np.percentile(g_np, 99.9)
+            if lo == hi:
+                lo, hi = lo - 1e-12, hi + 1e-12
+
+            ax.hist(g_np, bins=bins, range=(lo, hi), log=True)
+            ax.set_title(f"param[{start + i}] μ={mu:.2e} σ={sigma:.2e} ‖g‖₂={l2:.2e}")
+            ax.set_xlabel("grad value")
+            ax.set_ylabel("count")
+
+        # Hide any unused axes
+        for j in range(i + 1, len(axes)):
+            axes[j].axis("off")
+
+        # Global title and tight layout
+        fig.suptitle(fig_title(start, end), fontsize=12)
+        fig.tight_layout(rect=[0, 0.03, 1, 0.96])
+
+        # Build filename with key args for future search
+        fname = (
+            f"epoch{epoch:04d}_step{global_step:07d}"
+            f"_bs{args.batch_size}"
+            f"_lr{args.learning_rate:g}"
+            f"_clip{args.max_grad_norm:g}"
+            f"_parts{start:04d}-{end-1:04d}.png"
+        )
+        fpath = os.path.join(out_dir, fname)
+        fig.savefig(fpath, dpi=150)
+        plt.close(fig)
+        saved_paths.append(fpath)
+
+        start = end
+
+    return saved_paths
 
 
 @torch.no_grad()
@@ -327,6 +448,33 @@ def main(args):
                 if accelerator.sync_gradients:
                     params_to_clip = model.parameters()
                     grad_norm = accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                
+                grads = [p.grad.detach().clone() for p in model.parameters() if p.requires_grad]
+
+                # Plot and save gradient distributions at a reasonable interval for inspection
+                # study the gradient behavior of different layer
+                if accelerator.is_main_process and (global_step == 0 or (global_step % args.sampling_steps == 0)):
+                    save_root = os.path.join(args.output_dir, args.exp_name)
+                    try:
+                        saved_paths = plot_grad_distributions(
+                            grads=grads,
+                            save_root=save_root,
+                            epoch=epoch,
+                            global_step=global_step,
+                            args=args,
+                            bins=100,
+                            max_panels_per_fig=24,
+                        )
+                        # Optionally log first page to wandb for quick glance
+                        if len(saved_paths) > 0:
+                            accelerator.log({"grad_distributions": wandb.Image(saved_paths[0])}, step=global_step)
+                    except Exception as e:
+                        logging.warning(f"plot_grad_distributions failed: {e}")
+                
+                
+                
+                
+                
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
