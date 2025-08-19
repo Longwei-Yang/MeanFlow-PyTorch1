@@ -1,10 +1,11 @@
 import argparse
+from datetime import datetime
 import copy
 from copy import deepcopy
 import logging
 import os
 from pathlib import Path
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 import json
 
 import numpy as np
@@ -77,101 +78,147 @@ def plot_grad_distributions(
     global_step,
     args,
     bins=100,
-    max_panels_per_fig=24,
+    max_panels_per_fig=12,
+    param_names=None,
 ):
     """
     Plot per-parameter gradient distributions (histograms) and save under the experiment folder.
 
-    Args:
-        grads (List[Tensor]): list of per-parameter gradients in the same order as model.parameters()
-                              e.g., grads = [p.grad.detach().clone() for p in model.parameters() if p.requires_grad]
-        save_root (str): root dir for this experiment, e.g., os.path.join(args.output_dir, args.exp_name)
-        epoch (int): current epoch index
-        global_step (int): current global training step (before or after increment is fine, used for naming)
-        args (argparse.Namespace): full args; we will extract key fields for filename to help searching
-        bins (int): number of histogram bins
-        max_panels_per_fig (int): maximum number of subplots per saved figure; if there are more parameters,
-                                  the function will create multiple figures.
-    Returns:
-        List[str]: list of saved figure paths
+    Additionally dumps a JSON with per-parameter stats and simple group aggregates.
     """
-    # Ensure output directory
     out_dir = os.path.join(save_root, "grads")
     os.makedirs(out_dir, exist_ok=True)
 
-    # Flatten grads and convert to numpy for plotting
+    # Format readable parameter display names using the last few tokens
+    def format_name(pname: str, tail_parts: int = 3, max_chars: int = 40) -> str:
+        tokens = str(pname).split(".")
+        disp = ".".join(tokens[-min(tail_parts, len(tokens)):])
+        if len(disp) > max_chars:
+            keep = max_chars // 2 - 2
+            disp = disp[:keep] + "..." + disp[-keep:]
+        return disp
+
+    # Flatten grads and compute stats
     flat_grads = []
+    shapes = []
     stats = []
     for g in grads:
         if g is None:
             flat_grads.append(None)
-            stats.append((float('nan'), float('nan'), float('nan')))
-            continue
-        g_np = g.detach().float().view(-1).cpu().numpy()
-        flat_grads.append(g_np)
-        mu = float(np.mean(g_np)) if g_np.size > 0 else float('nan')
-        sigma = float(np.std(g_np)) if g_np.size > 0 else float('nan')
-        l2 = float(np.linalg.norm(g_np)) if g_np.size > 0 else float('nan')
-        stats.append((mu, sigma, l2))
+            shapes.append(None)
+            stats.append((float("nan"), float("nan"), float("nan")))
+        else:
+            g_np = g.detach().float().view(-1).cpu().numpy()
+            flat_grads.append(g_np)
+            shapes.append(tuple(g.size()))
+            mu = float(np.mean(g_np)) if g_np.size > 0 else float("nan")
+            sigma = float(np.std(g_np)) if g_np.size > 0 else float("nan")
+            l2 = float(np.linalg.norm(g_np)) if g_np.size > 0 else float("nan")
+            stats.append((mu, sigma, l2))
 
-    # Helper to build a readable, disambiguating title
     def fig_title(base_idx, idx_end):
-        return (f"Grad dists | exp={args.exp_name} | epoch={epoch} | step={global_step} | "
-                f"bs={args.batch_size} | lr={args.learning_rate:g} | "
-                f"clip={args.max_grad_norm:g} | range={base_idx}-{idx_end-1}")
+        return (
+            f"Grad dists | exp={args.exp_name} | epoch={epoch} | step={global_step} | "
+            f"bs={args.batch_size} | lr={args.learning_rate:g} | clip={args.max_grad_norm:g} | "
+            f"range={base_idx}-{idx_end-1}"
+        )
 
-    # Number of figures needed
     n_params = len(flat_grads)
     saved_paths = []
     if n_params == 0:
         return saved_paths
 
-    # Determine subplot grid (rows x cols) up to max_panels_per_fig, prefer 4 columns
+    if param_names is None or len(param_names) != n_params:
+        param_names = [f"param[{i}]" for i in range(n_params)]
+
     cols = 4
     rows = int(np.ceil(min(max_panels_per_fig, n_params) / cols))
 
-    # Iterate chunks
+    stats_all = []
+    group_aggr = defaultdict(lambda: {"count": 0, "l2_sq_sum": 0.0})
+
     start = 0
     while start < n_params:
         end = min(start + max_panels_per_fig, n_params)
         chunk = flat_grads[start:end]
         chunk_stats = stats[start:end]
+        chunk_names = param_names[start:end]
+        chunk_shapes = shapes[start:end]
 
-        # Recompute rows for last chunk if smaller
         panels = end - start
         rows = int(np.ceil(panels / cols))
 
         fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3.0 * rows), squeeze=False)
         axes = axes.flatten()
 
-        for i, (g_np, (mu, sigma, l2)) in enumerate(zip(chunk, chunk_stats)):
+        for i, (g_np, (mu, sigma, l2), pname, pshape) in enumerate(zip(chunk, chunk_stats, chunk_names, chunk_shapes)):
             ax = axes[i]
             if g_np is None or g_np.size == 0:
-                ax.set_title(f"param[{start + i}] | empty")
+                disp = format_name(pname)
+                ax.set_title(f"{disp} | empty | idx={start+i}")
                 ax.axis("off")
+                stats_all.append(
+                    {
+                        "param_index": int(start + i),
+                        "name": str(pname),
+                        "group": ".".join(str(pname).split(".")[:2]) if "." in str(pname) else str(pname),
+                        "count": 0,
+                        "mean": None,
+                        "std": None,
+                        "l2": None,
+                        "min": None,
+                        "max": None,
+                        "p01": None,
+                        "p999": None,
+                        "hist": None,
+                        "edges": None,
+                    }
+                )
                 continue
 
-            # Robust clipping of x-axis range for visibility
-            # Use percentiles to ignore extreme outliers when drawing hist
             lo = np.percentile(g_np, 0.1)
             hi = np.percentile(g_np, 99.9)
             if lo == hi:
                 lo, hi = lo - 1e-12, hi + 1e-12
 
             ax.hist(g_np, bins=bins, range=(lo, hi), log=True)
-            ax.set_title(f"param[{start + i}] μ={mu:.2e} σ={sigma:.2e} ‖g‖₂={l2:.2e}")
+            disp = format_name(pname, tail_parts=3, max_chars=40)
+            shape_str = "x".join(map(str, pshape)) if pshape is not None else "?"
+            ax.set_title(f"{disp} | idx={start+i} | {shape_str}\nμ={mu:.2e} σ={sigma:.2e} ‖g‖₂={l2:.2e}")
             ax.set_xlabel("grad value")
             ax.set_ylabel("count")
 
-        # Hide any unused axes
-        for j in range(i + 1, len(axes)):
+            counts, edges = np.histogram(g_np, bins=bins, range=(lo, hi))
+            stats_all.append(
+                {
+                    "param_index": int(start + i),
+                    "name": str(pname),
+                    "group": ".".join(str(pname).split(".")[:2]) if "." in str(pname) else str(pname),
+                    "count": int(g_np.size),
+                    "mean": float(mu),
+                    "std": float(sigma),
+                    "l2": float(l2),
+                    "min": float(np.min(g_np)),
+                    "max": float(np.max(g_np)),
+                    "p01": float(lo),
+                    "p999": float(hi),
+                    "hist": counts.astype(int).tolist(),
+                    "edges": edges.astype(float).tolist(),
+                }
+            )
+
+            group_key = ".".join(str(pname).split(".")[:2]) if "." in str(pname) else str(pname)
+            ga = group_aggr[group_key]
+            ga["count"] += int(g_np.size)
+            ga["l2_sq_sum"] += float(l2) ** 2
+
+        # hide unused axes
+        for j in range(len(chunk), len(axes)):
             axes[j].axis("off")
 
-        # Global title and tight layout
         fig.suptitle(fig_title(start, end), fontsize=12)
         fig.tight_layout(rect=[0, 0.03, 1, 0.96])
 
-        # Build filename with key args for future search
         fname = (
             f"epoch{epoch:04d}_step{global_step:07d}"
             f"_bs{args.batch_size}"
@@ -185,6 +232,40 @@ def plot_grad_distributions(
         saved_paths.append(fpath)
 
         start = end
+
+    try:
+        meta = {
+            "exp_name": args.exp_name,
+            "epoch": int(epoch),
+            "global_step": int(global_step),
+            "batch_size": int(args.batch_size),
+            "learning_rate": float(args.learning_rate),
+            "max_grad_norm": float(args.max_grad_norm),
+            "num_params": int(n_params),
+            "bins": int(bins),
+        }
+        groups_payload = []
+        for gname, gvals in sorted(group_aggr.items()):
+            groups_payload.append(
+                {
+                    "group": gname,
+                    "count": int(gvals["count"]),
+                    "l2": float(math.sqrt(gvals["l2_sq_sum"])) if gvals["l2_sq_sum"] > 0 else 0.0,
+                }
+            )
+
+        stats_payload = {"meta": meta, "params": stats_all, "groups": groups_payload}
+        stats_fname = (
+            f"epoch{epoch:04d}_step{global_step:07d}"
+            f"_bs{args.batch_size}"
+            f"_lr{args.learning_rate:g}"
+            f"_clip{args.max_grad_norm:g}_stats.json"
+        )
+        stats_fpath = os.path.join(out_dir, stats_fname)
+        with open(stats_fpath, "w") as f:
+            json.dump(stats_payload, f, indent=2)
+    except Exception as e:
+        logging.warning(f"Failed to save gradient stats JSON: {e}")
 
     return saved_paths
 
@@ -240,6 +321,14 @@ def requires_grad(model, flag=True):
 #################################################################################
 
 def main(args):    
+    # Auto-append timestamp to experiment name (YYYYMMDDHHMM), skip when resuming
+    try:
+        if getattr(args, "resume_step", 0) == 0:
+            ts = datetime.now().strftime("%Y%m%d%H%M")
+            args.exp_name = f"{args.exp_name}-{ts}"
+    except Exception:
+        pass
+    
     # set accelerator
     logging_dir = Path(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(
@@ -398,8 +487,27 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
+    # Save an initial checkpoint at training start to verify saving works
+    if accelerator.is_main_process:
+        try:
+            to_save_model = accelerator.unwrap_model(model)
+            init_ckpt = {
+                "model": to_save_model.state_dict(),
+                "ema": ema.state_dict(),
+                "opt": optimizer.state_dict(),
+                "args": args,
+                "steps": int(global_step),
+            }
+            init_ckpt_path = f"{checkpoint_dir}/{0:07d}.pt"
+            if not os.path.exists(init_ckpt_path):
+                accelerator.save(init_ckpt, init_ckpt_path)
+                logger.info(f"Saved initial checkpoint to {init_ckpt_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save initial checkpoint: {e}")
+
     # Labels to condition the model with (feel free to change):
-    sample_batch_size = 64 // accelerator.num_processes
+    # Use the same per-process batch size for sampling as training to avoid OOM and keep behavior consistent
+    sample_batch_size = local_batch_size
     gt_raw_images, gt_xs, _ = next(iter(train_dataloader))
     assert gt_raw_images.shape[-1] == args.resolution
     gt_xs = gt_xs[:sample_batch_size]
@@ -421,6 +529,13 @@ def main(args):
             z = None
             labels = y
             zs = None
+            # Metrics placeholders per step
+            was_clipped = 0.0
+            grad_to_weight_ratio_mean = float("nan")
+            grad_sparsity_pre = float("nan")
+            grad_sparsity_post = float("nan")
+            cos_sim_prev_grad = None
+            prev_params_snapshot = None
             with torch.no_grad():
                 x = sample_posterior(x, latents_scale=latents_scale, latents_bias=latents_bias)
                 if args.encoder_depth > 0:
@@ -434,7 +549,9 @@ def main(args):
                             zs.append(z)
 
             with accelerator.accumulate(model):
-                loss, proj_loss, v_loss = loss_fn(model, x, labels=labels, zs=zs)
+                # Mixed precision forward + loss for speed/VRAM
+                with accelerator.autocast():
+                    loss, proj_loss, v_loss = loss_fn(model, x, labels=labels, zs=zs)
                 loss_mean = loss.mean()
                 if args.encoder_depth > 0:
                     proj_loss_mean = proj_loss.mean()
@@ -446,36 +563,133 @@ def main(args):
                 ## optimization
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
+                    # Compute sparsity BEFORE clipping
+                    preclip_grads = [
+                        p.grad.detach().clone() if (p.requires_grad and p.grad is not None) else None
+                        for p in model.parameters()
+                    ]
+                    total_elems_pre = 0
+                    zero_elems_pre = 0
+                    for g in preclip_grads:
+                        if g is None:
+                            continue
+                        total_elems_pre += g.numel()
+                        thr = 1e-8 if g.dtype in (torch.float16, torch.bfloat16) else 1e-12
+                        zero_elems_pre += (g.abs() <= thr).sum().item()
+                    if total_elems_pre > 0:
+                        grad_sparsity_pre = float(zero_elems_pre) / float(total_elems_pre)
+
+                    # Clip gradients (grad_norm returned is pre-clip global norm)
                     params_to_clip = model.parameters()
                     grad_norm = accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 
-                grads = [p.grad.detach().clone() for p in model.parameters() if p.requires_grad]
+                    # Collect gradients AFTER clipping for diagnostics
+                    grads = [p.grad.detach().clone() if (p.requires_grad and p.grad is not None) else None for p in model.parameters()]
 
-                # Plot and save gradient distributions at a reasonable interval for inspection
-                # study the gradient behavior of different layer
-                if accelerator.is_main_process and (global_step == 0 or (global_step % args.sampling_steps == 0)):
-                    save_root = os.path.join(args.output_dir, args.exp_name)
+                    # Whether clipping actually happened
                     try:
-                        saved_paths = plot_grad_distributions(
-                            grads=grads,
-                            save_root=save_root,
-                            epoch=epoch,
-                            global_step=global_step,
-                            args=args,
-                            bins=100,
-                            max_panels_per_fig=24,
-                        )
-                        # Optionally log first page to wandb for quick glance
-                        if len(saved_paths) > 0:
-                            accelerator.log({"grad_distributions": wandb.Image(saved_paths[0])}, step=global_step)
-                    except Exception as e:
-                        logging.warning(f"plot_grad_distributions failed: {e}")
+                        was_clipped = float(grad_norm.item() > args.max_grad_norm + 1e-12)
+                    except Exception:
+                        was_clipped = 0.0
+
+                    # Mean grad/weight ratio across parameters
+                    gw_ratios = []
+                    for p, g in zip(model.parameters(), grads):
+                        if g is None:
+                            continue
+                        pw = p.data.float().norm().item()
+                        gw = g.float().norm().item()
+                        if pw > 0:
+                            gw_ratios.append(gw / pw)
+                    if len(gw_ratios) > 0:
+                        grad_to_weight_ratio_mean = float(np.mean(gw_ratios))
+
+                    # Gradient sparsity AFTER clipping (fraction of near-zero entries overall)
+                    total_elems = 0
+                    zero_elems = 0
+                    for g in grads:
+                        if g is None:
+                            continue
+                        total_elems += g.numel()
+                        thr = 1e-8 if (g is not None and g.dtype in (torch.float16, torch.bfloat16)) else 1e-12
+                        zero_elems += (g.abs() <= thr).sum().item()
+                    if total_elems > 0:
+                        grad_sparsity_post = float(zero_elems) / float(total_elems)
+
+                    # Gradient cosine similarity with previous step (only when logging to reduce cost)
+                    if accelerator.is_main_process and (global_step == 0 or (global_step % args.sampling_steps == 0)):
+                        try:
+                            flat_list = [g.view(-1) for g in grads if g is not None and g.numel() > 0]
+                            if len(flat_list) > 0:
+                                gflat = torch.cat(flat_list).float().cpu()
+                                # init cache on first use
+                                if not hasattr(main, "_prev_grad_flat"):
+                                    main._prev_grad_flat = None
+                                if main._prev_grad_flat is not None and main._prev_grad_flat.numel() == gflat.numel():
+                                    denom = (main._prev_grad_flat.norm() * gflat.norm()).item() + 1e-12
+                                    cos_sim_prev_grad = float(torch.dot(main._prev_grad_flat, gflat).item() / denom)
+                                main._prev_grad_flat = gflat #这个main的用法无敌，可以方便的调用上一次记录的结果
+                        except Exception:
+                            cos_sim_prev_grad = None
+
+                    # Plot and save gradient distributions at a reasonable interval for inspection
+                    # study the gradient behavior of different layer
+                    if accelerator.is_main_process and (global_step == 0 or (global_step % args.sampling_steps == 0)):
+                        save_root = os.path.join(args.output_dir, args.exp_name)
+                        try:
+                            # Build param names aligned with model.parameters() order
+                            param_names = [name for name, _ in model.named_parameters()]
+                            saved_paths = plot_grad_distributions(
+                                grads=grads,
+                                save_root=save_root,
+                                epoch=epoch,
+                                global_step=global_step,
+                                args=args,
+                                bins=100,
+                                max_panels_per_fig=24,
+                                param_names=param_names,
+                            )
+                            # Log the last page image to wandb for quick glance
+                            if len(saved_paths) > 0:
+                                last_img_path = saved_paths[-1]
+                                accelerator.log({"grad_distributions_last": wandb.Image(last_img_path)}, step=global_step)
+
+                            # Upload the corresponding JSON stats file
+                            try:
+                                grads_dir = os.path.join(args.output_dir, args.exp_name, "grads")
+                                stats_fname = (
+                                    f"epoch{epoch:04d}_step{global_step:07d}"
+                                    f"_bs{args.batch_size}"
+                                    f"_lr{args.learning_rate:g}"
+                                    f"_clip{args.max_grad_norm:g}_stats.json"
+                                )
+                                stats_fpath = os.path.join(grads_dir, stats_fname)
+                                if os.path.exists(stats_fpath):
+                                    try:
+                                        artifact = wandb.Artifact(
+                                            name=f"grad-stats-epoch{epoch:04d}-step{global_step:07d}",
+                                            type="grad-stats",
+                                        )
+                                        artifact.add_file(stats_fpath)
+                                        wandb.log_artifact(artifact)
+                                    except Exception as _e:
+                                        # Fallback: attach as a run file
+                                        wandb.save(stats_fpath)
+                            except Exception as e:
+                                logging.warning(f"Failed to log gradient stats JSON to wandb: {e}")
+                        except Exception as e:
+                            logging.warning(f"plot_grad_distributions failed: {e}")
                 
                 
                 
                 
                 
-                optimizer.step()
+                # Take parameter snapshot before step only when we plan to log update size (to save memory)
+                take_update_snapshot = accelerator.sync_gradients and accelerator.is_main_process and (global_step == 0 or (global_step % args.sampling_steps == 0))
+                if take_update_snapshot:
+                    prev_params_snapshot = [p.data.detach().clone() for p in model.parameters() if p.requires_grad]
+
+                optimizer.step() # Accelerate will no-op on non-sync micro steps
                 optimizer.zero_grad(set_to_none=True)
 
                 if accelerator.sync_gradients:
@@ -487,27 +701,32 @@ def main(args):
                 global_step += 1                
                 if global_step % args.checkpointing_steps == 0 and global_step > 0:
                     if accelerator.is_main_process:
-                        checkpoint = {
-                            "model": model.module.state_dict(),
-                            "ema": ema.state_dict(),
-                            "opt": optimizer.state_dict(),
-                            "args": args,
-                            "steps": global_step,
-                        }
-                        checkpoint_path = f"{checkpoint_dir}/{global_step:07d}.pt"
-                        torch.save(checkpoint, checkpoint_path)
-                        logger.info(f"Saved checkpoint to {checkpoint_path}")
+                        try:
+                            to_save_model = accelerator.unwrap_model(model)
+                            checkpoint = {
+                                "model": to_save_model.state_dict(),
+                                "ema": ema.state_dict(),
+                                "opt": optimizer.state_dict(),
+                                "args": args,
+                                "steps": int(global_step),
+                            }
+                            checkpoint_path = f"{checkpoint_dir}/{global_step:07d}.pt"
+                            accelerator.save(checkpoint, checkpoint_path)
+                            logger.info(f"Saved checkpoint to {checkpoint_path}")
+                        except Exception as e:
+                            logger.warning(f"Failed to save checkpoint at step {global_step}: {e}")
 
                 if (global_step == 1 or (global_step % args.sampling_steps == 0 and global_step > 0)):
                     from meanflow import mean_flow_sampler
-                    with torch.no_grad():
+                    with torch.no_grad(), accelerator.autocast():
                         samples = mean_flow_sampler(
                             model, 
                             loss_fn,
                             xT, 
                             ys,
                             num_steps=1, 
-                        ).to(torch.float32)
+                        )
+                        # Decode under autocast; cast to fp32 for logging after gather
                         samples = vae.decode((samples -  latents_bias) / latents_scale).sample
                         gt_samples = vae.decode((gt_xs - latents_bias) / latents_scale).sample
                         samples = (samples + 1) / 2.
@@ -523,6 +742,57 @@ def main(args):
                     "grad_norm": accelerator.gather(grad_norm).mean().detach().item(),
                     "v_loss": accelerator.gather(v_loss_mean).mean().detach().item(),
                 }
+                # Extended stability diagnostics
+                logs["was_clipped"] = was_clipped
+                logs["grad_to_weight_ratio_mean"] = grad_to_weight_ratio_mean
+                # Log both pre/post sparsity; keep legacy key mapped to post-clip
+                logs["grad_sparsity_pre"] = grad_sparsity_pre
+                logs["grad_sparsity_post"] = grad_sparsity_post
+                logs["grad_sparsity"] = grad_sparsity_post
+
+                # Compute single-step update norm and update/weight ratio if we took a snapshot
+                if prev_params_snapshot is not None:
+                    try:
+                        delta_sq_sum = 0.0
+                        upd_ratios = []
+                        # zip aligns with requires_grad params order
+                        for p, p_prev in zip(model.parameters(), prev_params_snapshot):
+                            if not p.requires_grad:
+                                continue
+                            delta = (p.data - p_prev).float()
+                            delta_sq_sum += delta.pow(2).sum().item()
+                            pw = p_prev.float().norm().item()
+                            dw = delta.norm().item()
+                            if pw > 0:
+                                upd_ratios.append(dw / pw)
+                        logs["update_norm"] = float(math.sqrt(delta_sq_sum))
+                        logs["update_to_weight_ratio_mean"] = float(np.mean(upd_ratios)) if len(upd_ratios) > 0 else float("nan")
+                    except Exception:
+                        pass
+
+                # Optimizer moment norms (AdamW)
+                try:
+                    m2 = 0.0
+                    v2 = 0.0
+                    for group in optimizer.param_groups:
+                        for p in group.get("params", []):
+                            st = optimizer.state.get(p, None)
+                            if not st:
+                                continue
+                            m = st.get("exp_avg", None)
+                            v = st.get("exp_avg_sq", None)
+                            if m is not None:
+                                m2 += m.float().pow(2).sum().item()
+                            if v is not None:
+                                v2 += v.float().pow(2).sum().item()
+                    logs["adam_m_norm"] = float(math.sqrt(m2)) if m2 > 0 else 0.0
+                    logs["adam_v_sqrt_sum"] = float(math.sqrt(v2)) if v2 > 0 else 0.0
+                except Exception:
+                    pass
+
+                # Optional: gradient cosine similarity to previous step
+                if cos_sim_prev_grad is not None:
+                    logs["cos_sim_prev_grad"] = cos_sim_prev_grad
                 if args.encoder_depth > 0:
                     logs["proj_loss"] = accelerator.gather(proj_loss_mean).mean().detach().item()
                 progress_bar.set_postfix(**logs)
@@ -571,7 +841,7 @@ def parse_args(input_args=None):
     # optimization
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--max-train-steps", type=int, default=400000)
-    parser.add_argument("--checkpointing-steps", type=int, default=50000)
+    parser.add_argument("--checkpointing-steps", type=int, default=20000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--adam-beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
